@@ -7,232 +7,297 @@
 #include <limits.h>
 #include <EEPROM.h>
 
+
 #define UP      9
 #define DOWN    10
 #define IN      11
 #define OUT     12
-
 #define HALL_DOWN    2
 #define HALL_IN      3
 #define BUTTON       18
+#define SERIAL_PORT            9600
 
-#define MAX_PRESETS    3
-#define PRESET_SIZE    8
+#define HEIGHT_ADDRESS   0x00
+#define DEPTH_ADDRESS    0x04
+#define HEIGHT_MAX_ADDRESS     0x08
+#define DEPTH_MAX_ADDRESS      0x0C
 
-enum {
-    STOP,
-    MOVE_UP,
-    MOVE_DOWN,
-    MOVE_IN,
-    MOVE_OUT,
-};
+#define PRESET_START_ADDRESS   0x10
+#define MAX_PRESETS            3
+#define PRESET_SIZE            8
+#define PRESET_ADDRESS(preset) (PRESET_START_ADDRESS + (preset * PRESET_SIZE))
 
-static volatile unsigned long inOutPulseCount = 0;
-static volatile unsigned long upDownPulseCount = 0;
-static bool movingIn = false;
-static bool movingDown = false;
-static int state = STOP;
+typedef struct {
+    bool up, down, in, out;
+} Movement;
 
-/* Function prototypes */
-static void moveToPosition(const unsigned long targetInOutPulses, const unsigned long targetUpDownPulses);
-static void updateMovement(void);
-static void savePreset(const int presetNumber);
-static void loadPreset(const int presetNumber);
+typedef struct {
+    volatile unsigned long height, depth;
+    unsigned long height_max, depth_max;
+    unsigned long height_min, depth_min;
+} Pulse;
+
+/* Declarations */
+static void update_movement(void);
 static void processSerialCommand(void);
+static void stop(void);
 static void calibrate(void);
-static void countPulses(void);
-static void countUpDownPulses(void);
+static unsigned long get_pulse(const int addr);
+static void set_pulse(const int addr, const unsigned long pulse);
+static void update_height(void);  
+static void update_depth(void);
+static void log(void);
 
-void setup() {
+static Movement *move;
+static Pulse *pulse;
+
+/**
+ * @brief 
+ *
+ *
+ */
+static void setup(void) {
+    /* Initialize pins */
     pinMode(UP, OUTPUT);
     pinMode(DOWN, OUTPUT);
     pinMode(IN, OUTPUT);
     pinMode(OUT, OUTPUT);
     pinMode(BUTTON, INPUT_PULLUP);
-    Serial.begin(9600);
 
-    attachInterrupt(digitalPinToInterrupt(HALL_IN), countPulses, RISING);
-    attachInterrupt(digitalPinToInterrupt(HALL_DOWN), countUpDownPulses, FALLING);
+    /* Initialize serial */
+    Serial.begin(SERIAL_PORT);
 
-    Serial.println("Standing Desk Control Ready");
+    /* Attach interrupts */
+    attachInterrupt(digitalPinToInterrupt(HALL_IN), update_depth, RISING);
+    attachInterrupt(digitalPinToInterrupt(HALL_DOWN), update_height, FALLING);
+    attachInterrupt(digitalPinToInterrupt(BUTTON), stop, FALLING);
+
+    move = (Movement *)malloc(sizeof(Movement));
+    pulse = (Pulse *)malloc(sizeof(Pulse));
+
+    /* Initialize pointers */
+    initialize_movement(move);
+    initialize_pulse(pulse);
+
+    Serial.println("SmartPods Control Ready");
 }
 
-void loop() {
-    processSerialCommand();  
-    updateMovement();
+/**
+ * @brief 
+ *
+ *
+ */
+static void loop(void) {
+    processSerialCommand();
+    update_movement();
+
+    set_pulse(HEIGHT_ADDRESS, pulse->height);
+    set_pulse(DEPTH_ADDRESS, pulse->depth);
 }
 
-static void updateMovement(void) {
-    switch (state) {
-        case MOVE_UP:
-            movingDown = false;
-            digitalWrite(UP, HIGH);
-            digitalWrite(DOWN, LOW);
-            digitalWrite(IN, LOW);
-            digitalWrite(OUT, LOW);
-            break;
-
-        case MOVE_DOWN:
-            movingDown = true;
-            digitalWrite(UP, LOW);
-            digitalWrite(DOWN, HIGH);
-            digitalWrite(IN, LOW);
-            digitalWrite(OUT, LOW);
-            break;
-
-        case MOVE_IN:
-            movingIn = true;
-            digitalWrite(UP, LOW);
-            digitalWrite(DOWN, LOW);
-            digitalWrite(IN, HIGH);
-            digitalWrite(OUT, LOW);
-            break;
-
-        case MOVE_OUT:
-            movingIn = false;
-            digitalWrite(UP, LOW);
-            digitalWrite(DOWN, LOW);
-            digitalWrite(IN, LOW);
-            digitalWrite(OUT, HIGH);
-            break;
-
-        case STOP:
-            digitalWrite(UP, LOW);
-            digitalWrite(DOWN, LOW);
-            digitalWrite(IN, LOW);
-            digitalWrite(OUT, LOW);
-            break;
-    }
+/**
+ * @brief 
+ *
+ *
+ */
+static void initialize_pulse(Pulse *pulse) {
+    pulse->height = get_pulse(HEIGHT_ADDRESS);
+    pulse->depth = get_pulse(DEPTH_ADDRESS);
+    pulse->height_max = get_pulse(HEIGHT_MAX_ADDRESS);  
+    pulse->depth_max = get_pulse(DEPTH_MAX_ADDRESS);
+    pulse->height_min = 0;
+    pulse->depth_min = 0;
+    return;
 }
 
-static void moveToPosition(const unsigned long targetInOutPulses, const unsigned long targetUpDownPulses) {
-    while (inOutPulseCount != targetInOutPulses) {
-        if (inOutPulseCount < targetInOutPulses) {
-            state = MOVE_IN;
-        } else {
-            state = MOVE_OUT;
-        }
-        updateMovement();
-        delay(10);
-    }
-    
-    while (upDownPulseCount != targetUpDownPulses) {
-        if (upDownPulseCount < targetUpDownPulses) {
-            state = MOVE_DOWN;
-        } else {
-            state = MOVE_UP;
-        }
-        updateMovement();
-        delay(10);
-    }
-    
-    state = STOP;
-    updateMovement();
+/**
+ * @brief 
+ *
+ *
+ */
+static void initialize_movement(Movement *move) {
+    move->up = false;
+    move->down = false;
+    move->in = false;
+    move->out = false;
+    return;
 }
 
-static void savePreset(const int presetNumber) {
-    if (presetNumber >= 1 && presetNumber <= MAX_PRESETS) {
-        int address = (presetNumber - 1) * PRESET_SIZE;
-        EEPROM.put(address, inOutPulseCount);
-        EEPROM.put(address + 4, upDownPulseCount);
-        Serial.print("Preset ");
-        Serial.print(presetNumber);
-        Serial.println(" saved.");
-    }
+/**
+ * @brief 
+ *
+ *
+ */
+static void update_movement(void) {
+    digitalWrite(UP, move->up ? HIGH : LOW);
+    digitalWrite(DOWN, move->down ? HIGH : LOW);
+    digitalWrite(OUT, move->out ? HIGH : LOW);
+    digitalWrite(IN, move->in ? HIGH : LOW);
 }
 
-static void loadPreset(const int presetNumber) {
-    if (presetNumber >= 1 && presetNumber <= MAX_PRESETS) {
-        int address = (presetNumber - 1) * PRESET_SIZE;
-        unsigned long savedInOutPulses, savedUpDownPulses;
-        EEPROM.get(address, savedInOutPulses);
-        EEPROM.get(address + 4, savedUpDownPulses);
-        moveToPosition(savedInOutPulses, savedUpDownPulses);
-    }
-}
-
+/**
+ * @brief 
+ *
+ *
+ */
 static void processSerialCommand(void) {
     if (Serial.available() > 0) {
         String command = Serial.readStringUntil('\n');
         command.trim();
-        
-        if (command.startsWith("SAVE")) {
-            int presetNumber = command.substring(4).toInt();
-            savePreset(presetNumber);
-        } else if (command.startsWith("LOAD")) {
-            int presetNumber = command.substring(4).toInt();
-            loadPreset(presetNumber);
-        } else if (command.startsWith("MOVE")) {
-            int inOut = command.substring(5, command.indexOf(',')).toInt();
-            int upDown = command.substring(command.indexOf(',') + 1).toInt();
-            moveToPosition(inOut, upDown);
-        } else if (command == "CALIBRATE") {
-            calibrate();
+
+        if (command == "STOP") {
+            stop();
         } else {
             switch (command.charAt(0)) {
-                case 'U': state = MOVE_UP; break;
-                case 'D': state = MOVE_DOWN; break;
-                case 'I': state = MOVE_IN; break;
-                case 'O': state = MOVE_OUT; break;
-                case 'S': state = STOP; break;
+                case 'C':
+                case 'c':
+                    calibrate();
+                    break;
+
+                case 'U':
+                case 'u':
+                    move->up = true; 
+                    break;
+
+                case 'D':
+                case 'd':
+                    move->down = true;
+                    break;
+
+                case 'I':
+                case 'i':
+                    move->in = true; 
+                    break;
+
+                case 'O':
+                case 'o':
+                    move->out = true; 
+                    break;
+
+                case 'S':
+                case 's':
+                    stop();
+                    break;
+
+                default:
+                    Serial.println("Unknown command");
+                    break;
             }
         }
     }
 }
 
+/**
+ * @brief 
+ *
+ *
+ */
+static void stop(void) {
+    move->up = false; 
+    move->down = false; 
+    move->in = false;
+    move->out = false; 
+}
 
+/**
+ * @brief 
+ *
+ *
+ */
 static void calibrate(void) {
     Serial.println("Starting calibration...");
-    
+
     /* Move to lowest position */
-    state = MOVE_DOWN;
-    updateMovement();
-    delay(35000);
+    move->down = true;
+    move->in = true;
+    update_movement();
+    delay(30000);
 
-    /* Move to inner position */
-    state = MOVE_IN;
-    updateMovement();
-    delay(20000);
-    
+    stop();
+
     /* Reset counters */
-    inOutPulseCount = 0;
-    upDownPulseCount = 0;
-    
-    /* Move to highest position */
-    state = MOVE_UP;
-    updateMovement();
+    pulse->height = 0;
+    pulse->depth = 0;
+
+    move->up = true;
+    move->out = true;
+    update_movement();
     delay(35000);
 
-    /* Move to outer position */
-    state = MOVE_OUT;
-    updateMovement();
-    delay(20000);
+    stop();
 
     Serial.print("Max height: ");
-    Serial.print(upDownPulseCount);
+    Serial.print(pulse->height);
     Serial.println(" pulses");
 
-    Serial.print("Max width: ");
-    Serial.print(inOutPulseCount);
+    Serial.print("Max depth: ");
+    Serial.print(pulse->depth);
     Serial.println(" pulses"); 
-       
-    state = STOP;
-    updateMovement();
+
+    pulse->height_max = pulse->height;
+    pulse->depth_max = pulse->depth;
+
     Serial.println("Calibration complete.");
 }
 
-static void countPulses(void) {
-    if (movingIn) {
-        inOutPulseCount++;
-    } else {
-        inOutPulseCount--;
-    }
+/**
+ * @brief 
+ *
+ *
+ */
+static unsigned long get_pulse(const int addr) {
+    unsigned long pulse;
+    EEPROM.get(addr, pulse);
+    return pulse;
 }
 
-static void countUpDownPulses(void) {
-    if (movingDown) {
-        upDownPulseCount++;
-    } else {
-        upDownPulseCount--;
+/**
+ * @brief 
+ *
+ *
+ */
+static void set_pulse(const int addr, const unsigned long pulse) {
+    if (pulse == get_pulse(addr)) {
+        return;
     }
+
+    Serial.print("Updating ");
+    Serial.print((addr == HEIGHT_ADDRESS) ? "height " : "depth ");
+    Serial.print("address: ");
+    Serial.println(pulse);
+
+    EEPROM.put(addr, pulse);
+    return;
 }
+
+
+/**
+ * @brief 
+ *
+ *
+ */
+static void update_height(void) {
+    if (move->up == true) {
+        pulse->height++;
+    }
+
+    if (move->down == true) {
+        pulse->height--;
+    }
+
+    return;
+}
+
+static void update_depth(void) {
+    if (move->out == true) {
+        pulse->depth++;
+    }
+
+    if (move->in == true) {
+        pulse->depth--;
+    }
+  
+    return;
+}
+
+
